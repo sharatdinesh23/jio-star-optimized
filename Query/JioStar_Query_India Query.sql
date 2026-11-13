@@ -91,7 +91,7 @@ WITH final_report AS (
                 THEN -ABS(ABS(paymentamount::numeric) - taxamount::numeric)
             ELSE hsbalance
         END AS final_amount
-    FROM cointab.ir_files
+    FROM jiostar_data.december_internal_india_data
 ),	
 aggregated_report AS (
     SELECT

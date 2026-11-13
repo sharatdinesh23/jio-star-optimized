@@ -74,6 +74,6 @@ ORDER BY gateway_name ASC, service_start_date::DATE ASC, serviceenddate::DATE AS
 
 
 SELECT * 
-FROM jiostar_data.december_internal_sg_data;
+FROM jiostar_data.december_internal_sg_data;	
 
 
