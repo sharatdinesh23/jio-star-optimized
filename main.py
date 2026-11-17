@@ -1,38 +1,65 @@
-"""
-JioStar High-Performance Data Ingestion Pipeline
-=================================================
-Reads data from folders specified in .env, processes data files in batches,
-and dumps the data into a PostgreSQL database under the 'jiostar_data' schema.
-Each table name corresponds to its source folder name.
-
-Optimized with PostgreSQL native COPY streaming:
-Processes 400,000 - 500,000 records in seconds instead of minutes.
-"""
-
 import argparse
 import csv
 import io
 import json
-import logging
 import os
 import re
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
-from typing import Generator, List, Optional, Set, Tuple
+from typing import Generator, List, Optional, Set, TextIO, Tuple
 
 import pandas as pd
 from dotenv import load_dotenv
+from loguru import logger
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.engine import Engine
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)],
-)
-logger = logging.getLogger("jiostar_loader")
+DEFAULT_CSV_FIELD_SIZE_LIMIT = 64 * 1024 * 1024
+
+
+def configure_logging() -> Path:
+    """Creates colorized console logging and a fresh file sink for this run."""
+    logs_dir = Path(__file__).resolve().parent / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    log_path = logs_dir / f"jiostar_{run_id}_{os.getpid()}.log"
+    log_format = "{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {message}"
+
+    logger.remove()
+    logger.add(
+        sys.stdout,
+        format=f"<green>{{time:YYYY-MM-DD HH:mm:ss.SSS}}</green> | "
+        f"<level>{{level: <8}}</level> | <level>{{message}}</level>",
+        level="INFO",
+        colorize=True,
+        backtrace=True,
+        diagnose=False,
+    )
+    logger.add(
+        str(log_path),
+        format=log_format,
+        level="DEBUG",
+        colorize=False,
+        encoding="utf-8",
+        backtrace=True,
+        diagnose=False,
+    )
+    logger.info("Run log: {}", log_path)
+    return log_path
+
+
+def get_csv_field_size_limit() -> int:
+    """Reads and validates the configured CSV field-size limit in characters."""
+    raw_limit = os.getenv("CSV_FIELD_SIZE_LIMIT", str(DEFAULT_CSV_FIELD_SIZE_LIMIT))
+    try:
+        field_size_limit = int(raw_limit)
+    except ValueError as exc:
+        raise ValueError("CSV_FIELD_SIZE_LIMIT must be a positive integer.") from exc
+    if field_size_limit <= 0:
+        raise ValueError("CSV_FIELD_SIZE_LIMIT must be a positive integer.")
+    return field_size_limit
 
 
 def sanitize_identifier(name: str) -> str:
@@ -96,7 +123,7 @@ def get_supported_files(folder_path: Path) -> List[Path]:
             if file_path.suffix.lower() in supported_extensions:
                 files.append(file_path)
             elif file_path.suffix.lower() == ".zip":
-                logger.debug("Skipping archive (extract if data is inside): %s", file_path)
+                logger.debug("Skipping archive (extract if data is inside): {}", file_path)
 
     return files
 
@@ -134,7 +161,7 @@ def ensure_schema_exists(engine: Engine, schema_name: str) -> None:
     """Ensures the PostgreSQL schema exists."""
     with engine.begin() as conn:
         conn.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{schema_name}";'))
-    logger.info("Schema '%s' verified/created.", schema_name)
+    logger.info("Schema '{}' verified/created.", schema_name)
 
 
 def create_table_if_not_exists(
@@ -186,7 +213,7 @@ def sync_table_columns(
             )
             conn.execute(alter_query)
             known_columns.add(col)
-            logger.info("Table '%s.%s': added new column '%s'.", schema_name, table_name, col)
+            logger.info("Table '{}.{}': added new column '{}'.", schema_name, table_name, col)
 
 
 def test_database_connection(engine: Engine) -> bool:
@@ -196,8 +223,44 @@ def test_database_connection(engine: Engine) -> bool:
             conn.execute(text("SELECT 1;"))
         return True
     except Exception as exc:
-        logger.error("Failed to connect to PostgreSQL database: %s", exc)
+        logger.exception("Failed to connect to PostgreSQL database: {}", exc)
         return False
+
+
+def iter_limited_csv_lines(
+    source: TextIO,
+    file_path: Path,
+    field_size_limit: int,
+    nul_characters_removed: List[int],
+) -> Generator[str, None, None]:
+    """Removes NULs and bounds physical line size before CSV parsing."""
+    line_number = 0
+    pending_line: List[str] = []
+    pending_length = 0
+    chunk_size = min(64 * 1024, field_size_limit + 1)
+
+    while True:
+        chunk = source.readline(chunk_size)
+        if not chunk:
+            if pending_line:
+                yield "".join(pending_line)
+            return
+
+        nul_characters_removed[0] += chunk.count("\x00")
+        chunk = chunk.replace("\x00", "")
+        pending_length += len(chunk)
+        if pending_length > field_size_limit:
+            raise ValueError(
+                f"{file_path.name}: physical line {line_number + 1} exceeds the "
+                f"{field_size_limit:,}-character safety limit; the CSV row is malformed or oversized."
+            )
+        if chunk:
+            pending_line.append(chunk)
+        if chunk.endswith("\n"):
+            line_number += 1
+            yield "".join(pending_line)
+            pending_line = []
+            pending_length = 0
 
 
 def copy_csv_in_batches(
@@ -222,56 +285,129 @@ def copy_csv_in_batches(
 
     total_rows = 0
     batch_count = 0
+    nul_characters_removed = [0]
+    padded_rows = 0
+    padded_fields = 0
 
-    with open(file_path, "r", encoding="utf-8", errors="replace") as f:
-        # Skip header line in source file
-        _ = f.readline()
+    field_size_limit = get_csv_field_size_limit()
+    try:
+        csv.field_size_limit(field_size_limit)
+    except OverflowError as exc:
+        raise ValueError("CSV_FIELD_SIZE_LIMIT exceeds the supported range.") from exc
 
-        batch_lines = []
+    with open(file_path, "r", encoding="utf-8", errors="replace", newline="") as f:
+        reader = csv.reader(
+            iter_limited_csv_lines(f, file_path, field_size_limit, nul_characters_removed)
+        )
+        next(reader, None)
+
+        batch_buffer = io.StringIO(newline="")
+        writer = csv.writer(batch_buffer, lineterminator="\n")
+        rows_in_batch = 0
+
         with raw_conn.cursor() as cur:
-            for line in f:
-                batch_lines.append(line)
-                if len(batch_lines) >= batch_size:
-                    batch_start = time.time()
-                    batch_text = "".join(batch_lines)
-                    s_buf = io.StringIO(batch_text)
-                    cur.copy_expert(copy_sql, s_buf)
-                    raw_conn.commit()
+            try:
+                for record_number, row in enumerate(reader, start=2):
+                    if len(row) > len(clean_columns):
+                        logger.error(
+                            "Malformed CSV row: file={} record={} physical_line={} "
+                            "actual_fields={} expected_fields={} row={}",
+                            file_path.name,
+                            record_number,
+                            reader.line_num,
+                            len(row),
+                            len(clean_columns),
+                            json.dumps(row, ensure_ascii=False),
+                        )
+                        raise ValueError(
+                            f"{file_path.name}: CSV record {record_number} (ending at line "
+                            f"{reader.line_num}) has {len(row)} fields; expected at most "
+                            f"{len(clean_columns)}."
+                        )
+                    if len(row) < len(clean_columns):
+                        missing_fields = len(clean_columns) - len(row)
+                        logger.error(
+                            "CSV row has missing trailing fields: file={} record={} physical_line={} "
+                            "actual_fields={} expected_fields={} row={}",
+                            file_path.name,
+                            record_number,
+                            reader.line_num,
+                            len(row),
+                            len(clean_columns),
+                            json.dumps(row, ensure_ascii=False),
+                        )
+                        row.extend([""] * missing_fields)
+                        padded_rows += 1
+                        padded_fields += missing_fields
 
-                    rows_in_batch = len(batch_lines)
-                    total_rows += rows_in_batch
-                    batch_count += 1
-                    batch_duration = time.time() - batch_start
-                    speed = rows_in_batch / batch_duration if batch_duration > 0 else 0
-                    logger.info(
-                        "      * Batch %d: %d rows committed via COPY in %.2fs (%.0f rows/s)",
-                        batch_count,
-                        rows_in_batch,
-                        batch_duration,
-                        speed,
-                    )
-                    batch_lines = []
+                    cleaned_row = []
+                    for value in row:
+                        cleaned_row.append(value.replace("\x00", ""))
+                    writer.writerow(cleaned_row)
+                    rows_in_batch += 1
 
-            # Flush remaining lines
-            if batch_lines:
+                    if rows_in_batch >= batch_size:
+                        batch_start = time.time()
+                        batch_buffer.seek(0)
+                        cur.copy_expert(copy_sql, batch_buffer)
+                        raw_conn.commit()
+
+                        total_rows += rows_in_batch
+                        batch_count += 1
+                        batch_duration = time.time() - batch_start
+                        speed = rows_in_batch / batch_duration if batch_duration > 0 else 0
+                        logger.info(
+                            "      * Batch {}: {} rows committed via COPY in {:.2f}s ({:.0f} rows/s)",
+                            batch_count,
+                            rows_in_batch,
+                            batch_duration,
+                            speed,
+                        )
+                        batch_buffer.seek(0)
+                        batch_buffer.truncate(0)
+                        rows_in_batch = 0
+            except csv.Error as exc:
+                logger.exception(
+                    "CSV parsing failed in {} near physical line {}",
+                    file_path.name,
+                    reader.line_num,
+                )
+                raise ValueError(
+                    f"{file_path.name}: CSV parsing failed at physical line {reader.line_num}: {exc}"
+                ) from exc
+
+            if rows_in_batch:
                 batch_start = time.time()
-                batch_text = "".join(batch_lines)
-                s_buf = io.StringIO(batch_text)
-                cur.copy_expert(copy_sql, s_buf)
+                batch_buffer.seek(0)
+                cur.copy_expert(copy_sql, batch_buffer)
                 raw_conn.commit()
 
-                rows_in_batch = len(batch_lines)
                 total_rows += rows_in_batch
                 batch_count += 1
                 batch_duration = time.time() - batch_start
                 speed = rows_in_batch / batch_duration if batch_duration > 0 else 0
                 logger.info(
-                    "      * Batch %d: %d rows committed via COPY in %.2fs (%.0f rows/s)",
+                    "      * Batch {}: {} rows committed via COPY in {:.2f}s ({:.0f} rows/s)",
                     batch_count,
                     rows_in_batch,
                     batch_duration,
                     speed,
                 )
+
+    if nul_characters_removed[0]:
+        logger.warning(
+            "Removed {} NUL character(s) from {} because PostgreSQL text columns cannot store them.",
+            nul_characters_removed[0],
+            file_path.name,
+        )
+    if padded_rows:
+        logger.warning(
+            "Padded {} row(s) in {} with {} trailing empty field(s) to match the {}-column header.",
+            padded_rows,
+            file_path.name,
+            padded_fields,
+            len(clean_columns),
+        )
 
     return total_rows, batch_count
 
@@ -348,6 +484,7 @@ def run_dry_run(folder_paths: List[Path], batch_size: int, schema_name: str) -> 
         print(f"    Table Name: {schema_name}.{table_name}")
 
         if not folder_path.exists():
+            logger.warning("Dry-run folder does not exist: {}", folder_path)
             print(f"    [WARNING] Directory does not exist: {folder_path}\n")
             continue
 
@@ -377,6 +514,7 @@ def run_dry_run(folder_paths: List[Path], batch_size: int, schema_name: str) -> 
                     f"    - [{idx}/{len(files)}] {f.name:<45} (Sampled {rows_sampled:,} rows in {format_duration(sample_duration)})"
                 )
             except Exception as err:
+                logger.exception("Dry-run inspection failed for {}: {}", f, err)
                 print(f"    - [{idx}/{len(files)}] {f.name:<45} (Error: {err})")
 
         folder_elapsed = time.time() - folder_dry_start
@@ -392,6 +530,8 @@ def run_dry_run(folder_paths: List[Path], batch_size: int, schema_name: str) -> 
 
 def import_folders_to_postgres():
     """Main pipeline to orchestrate reading from folders and dumping to PostgreSQL."""
+    configure_logging()
+
     # 1. Parse Command Line Arguments
     parser = argparse.ArgumentParser(description="Batch import data folders into PostgreSQL.")
     parser.add_argument(
@@ -405,9 +545,9 @@ def import_folders_to_postgres():
     env_path = Path(".env")
     if env_path.exists():
         load_dotenv(dotenv_path=env_path)
-        logger.info("Loaded configuration from %s", env_path.resolve())
+        logger.info("Loaded configuration from {}", env_path.resolve())
     else:
-        logger.warning(".env file not found at %s. Relying on system environment variables.", env_path.resolve())
+        logger.warning(".env file not found at {}. Relying on system environment variables.", env_path.resolve())
 
     # 3. Read Database Configurations
     db_host = os.getenv("DB_HOST", "localhost")
@@ -439,7 +579,7 @@ def import_folders_to_postgres():
 
     # 4. Initialize Database Engine
     db_url = f"postgresql+psycopg2://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}"
-    logger.info("Connecting to PostgreSQL at %s:%s / %s...", db_host, db_port, db_name)
+    logger.info("Connecting to PostgreSQL at {}:{} / {}...", db_host, db_port, db_name)
 
     engine = create_engine(db_url, pool_pre_ping=True)
 
@@ -470,11 +610,11 @@ def import_folders_to_postgres():
             table_name = sanitize_identifier(raw_folder_name)
 
             logger.info("=" * 70)
-            logger.info("Processing Folder: '%s' -> Table: '%s.%s'", folder_path, schema_name, table_name)
+            logger.info("Processing Folder: '{}' -> Table: '{}.{}'", folder_path, schema_name, table_name)
             logger.info("=" * 70)
 
             if not folder_path.exists():
-                logger.warning("Folder does not exist: %s. Skipping.", folder_path)
+                logger.warning("Folder does not exist: {}. Skipping.", folder_path)
                 summary_results.append({
                     "folder": str(folder_path),
                     "table": table_name,
@@ -487,7 +627,7 @@ def import_folders_to_postgres():
 
             files = get_supported_files(folder_path)
             if not files:
-                logger.warning("No supported tabular data files found in %s.", folder_path)
+                logger.warning("No supported tabular data files found in {}.", folder_path)
                 summary_results.append({
                     "folder": str(folder_path),
                     "table": table_name,
@@ -498,7 +638,7 @@ def import_folders_to_postgres():
                 })
                 continue
 
-            logger.info("Found %d data file(s) in '%s'.", len(files), folder_path)
+            logger.info("Found {} data file(s) in '{}'.", len(files), folder_path)
 
             inspector = inspect(engine)
             table_exists = inspector.has_table(table_name, schema=schema_name)
@@ -507,7 +647,7 @@ def import_folders_to_postgres():
                 with engine.begin() as conn:
                     conn.execute(text(f'DROP TABLE IF EXISTS "{schema_name}"."{table_name}" CASCADE;'))
                 table_exists = False
-                logger.info("Dropped existing table '%s.%s' (TABLE_IF_EXISTS=replace).", schema_name, table_name)
+                logger.info("Dropped existing table '{}.{}' (TABLE_IF_EXISTS=replace).", schema_name, table_name)
 
             known_columns: Set[str] = set()
             if table_exists:
@@ -518,7 +658,7 @@ def import_folders_to_postgres():
 
             for file_idx, file_path in enumerate(files, start=1):
                 file_start_time = time.time()
-                logger.info("[%d/%d] Starting upload: %s", file_idx, len(files), file_path.name)
+                logger.info("[{}/{}] Starting upload: {}", file_idx, len(files), file_path.name)
 
                 file_rows = 0
                 file_batches = 0
@@ -527,9 +667,8 @@ def import_folders_to_postgres():
                 try:
                     if is_csv:
                         # Extract column header from CSV
-                        with open(file_path, "r", encoding="utf-8", errors="replace") as fp:
-                            header_line = fp.readline().strip()
-                            raw_cols = next(csv.reader([header_line]))
+                        with open(file_path, "r", encoding="utf-8", errors="replace", newline="") as fp:
+                            raw_cols = next(csv.reader(fp), [])
                             clean_cols = [sanitize_identifier(c) for c in raw_cols]
 
                         # Create table if it doesn't exist yet
@@ -599,7 +738,7 @@ def import_folders_to_postgres():
                     file_duration = time.time() - file_start_time
                     throughput = (file_rows / file_duration) if file_duration > 0 else 0
                     logger.info(
-                        "    -> Completed '%s' in %s (%s rows, %d batches, %.0f rows/s).",
+                        "    -> Completed '{}' in {} ({}, {} batches, {:.0f} rows/s).",
                         file_path.name,
                         format_duration(file_duration),
                         f"{file_rows:,}",
@@ -619,13 +758,13 @@ def import_folders_to_postgres():
                     })
 
                 except Exception as file_err:
+                    raw_conn.rollback()
                     file_duration = time.time() - file_start_time
-                    logger.error(
-                        "Error processing file %s after %s: %s",
+                    logger.exception(
+                        "Error processing file {} after {}: {}",
                         file_path.name,
                         format_duration(file_duration),
                         file_err,
-                        exc_info=True,
                     )
                     file_upload_stats.append({
                         "file_name": file_path.name,
@@ -653,6 +792,19 @@ def import_folders_to_postgres():
 
     # 7. Print Final Execution Summary Tables
     total_elapsed = time.time() - start_time
+
+    logger.info("FOLDER-LEVEL INGESTION SUMMARY")
+    for res in summary_results:
+        logger.info(
+            "Folder={} Table={} Files={} Rows={} Duration={} Status={}",
+            res["folder"],
+            res["table"],
+            res["files"],
+            res["rows"],
+            res["duration"],
+            res["status"],
+        )
+    logger.info("Total Pipeline Duration: {}", format_duration(total_elapsed))
 
     # Per-File Upload Performance Report
     if file_upload_stats:
@@ -686,7 +838,11 @@ def import_folders_to_postgres():
 
 
 def main():
-    import_folders_to_postgres()
+    try:
+        import_folders_to_postgres()
+    except Exception:
+        logger.exception("Pipeline terminated unexpectedly.")
+        raise
 
 
 if __name__ == "__main__":

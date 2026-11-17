@@ -17,6 +17,7 @@ Each destination table name automatically matches the name of its source folder 
 - **Per-File Upload Tracking**: Displays real-time upload duration, batch count, and throughput (rows/sec) for every individual file processed.
 - **Detailed Summary Reports**: Prints both a dedicated per-file upload performance table and a folder-level summary table upon completion.
 - **Execution Summary**: Provides a clear console report with file counts, row counts, and duration upon completion.
+- **Per-Run Logs**: Prints colorized logs to the console and writes a separate UTF-8 log file under `logs/` for every run, including error details and malformed CSV rows.
 
 ---
 
@@ -82,4 +83,5 @@ python main.py
 - `sqlalchemy`
 - `psycopg2-binary`
 - `python-dotenv`
+- `loguru`
 
