@@ -8,7 +8,7 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Generator, List, Optional, Set, TextIO, Tuple
+from typing import Dict, Generator, List, Optional, Set, TextIO, Tuple
 
 import pandas as pd
 from dotenv import load_dotenv
@@ -17,6 +17,15 @@ from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.engine import Engine
 
 DEFAULT_CSV_FIELD_SIZE_LIMIT = 64 * 1024 * 1024
+
+SUPPORTED_ENTITIES = ["india", "uk", "singapore", "canada"]
+
+ENTITY_PATTERNS = {
+    "india": [r"(?:^|[\W_])(?:india|indian|in)(?:[\W_]|$)", r"bot_in_"],
+    "uk": [r"(?:^|[\W_])(?:uk|united[-_ ]?kingdom|great[-_ ]?britain|gb)(?:[\W_]|$)", r"bot_uk_"],
+    "singapore": [r"(?:^|[\W_])(?:singapore|sg)(?:[\W_]|$)", r"bot_sg_"],
+    "canada": [r"(?:^|[\W_])(?:canada|ca)(?:[\W_]|$)", r"bot_ca_"],
+}
 
 
 def configure_logging() -> Path:
@@ -79,6 +88,26 @@ def sanitize_identifier(name: str) -> str:
     return clean if clean else "unnamed"
 
 
+def detect_entity_from_path(path_str: str) -> Optional[str]:
+    """Detects which of the 4 entities a folder path or link belongs to."""
+    normalized = path_str.lower().strip()
+    for entity, patterns in ENTITY_PATTERNS.items():
+        for pat in patterns:
+            if re.search(pat, normalized):
+                return entity
+    return None
+
+
+def clean_path_string(path_str: str) -> str:
+    """Normalizes URL-like paths (e.g. file://) and strips quotes."""
+    p = path_str.strip().strip('"').strip("'")
+    if p.startswith("file:///"):
+        p = p[8:]
+    elif p.startswith("file://"):
+        p = p[7:]
+    return p
+
+
 def parse_folder_list(folders_raw: str) -> List[str]:
     """
     Parses folder configuration from .env.
@@ -106,6 +135,84 @@ def parse_folder_list(folders_raw: str) -> List[str]:
     return result
 
 
+def resolve_entity_folders() -> Dict[str, List[Path]]:
+    """
+    Resolves data folders/links for the 4 entities: India, UK, Singapore, Canada.
+    Sources checked:
+    1. Direct entity env vars: DATA_FOLDER_<COUNTRY> or DATA_LINK_<COUNTRY>
+    2. Combined list / mapping in DATA_FOLDERS or DATA_LINKS:
+       - JSON dict: {"india": "path/1", ...}
+       - Key-value pairs: india=path1, uk=path2
+       - Comma-separated list with auto-detection matching
+    """
+    entity_folders: Dict[str, List[Path]] = {entity: [] for entity in SUPPORTED_ENTITIES}
+
+    # 1. Direct env vars per entity
+    for entity in SUPPORTED_ENTITIES:
+        env_keys = [
+            f"DATA_FOLDER_{entity.upper()}",
+            f"DATA_LINK_{entity.upper()}",
+            f"FOLDER_{entity.upper()}",
+            f"LINK_{entity.upper()}",
+        ]
+        for key in env_keys:
+            val = os.getenv(key, "").strip()
+            if val:
+                for sub_p in parse_folder_list(val):
+                    c = clean_path_string(sub_p)
+                    if c:
+                        p_obj = Path(c)
+                        if p_obj not in entity_folders[entity]:
+                            entity_folders[entity].append(p_obj)
+
+    # 2. Combined DATA_FOLDERS or DATA_LINKS
+    combined_raw = os.getenv("DATA_FOLDERS", "") or os.getenv("DATA_LINKS", "")
+    if combined_raw.strip():
+        raw_trimmed = combined_raw.strip()
+        if raw_trimmed.startswith("{") and raw_trimmed.endswith("}"):
+            try:
+                data_dict = json.loads(raw_trimmed)
+                for k, v in data_dict.items():
+                    ent = detect_entity_from_path(k) or (k.lower() if k.lower() in SUPPORTED_ENTITIES else None)
+                    if ent and ent in entity_folders:
+                        val_paths = v if isinstance(v, list) else [v]
+                        for vp in val_paths:
+                            c = clean_path_string(str(vp))
+                            if c:
+                                p_obj = Path(c)
+                                if p_obj not in entity_folders[ent]:
+                                    entity_folders[ent].append(p_obj)
+            except json.JSONDecodeError:
+                pass
+        else:
+            items = parse_folder_list(raw_trimmed)
+            for item in items:
+                # Check for key=value or key:value
+                if "=" in item or (":" in item and not (len(item) > 2 and item[1] == ":")):
+                    sep = "=" if "=" in item else ":"
+                    k, v = item.split(sep, 1)
+                    ent = detect_entity_from_path(k) or (k.lower() if k.lower() in SUPPORTED_ENTITIES else None)
+                    c = clean_path_string(v)
+                    if ent and c:
+                        p_obj = Path(c)
+                        if p_obj not in entity_folders[ent]:
+                            entity_folders[ent].append(p_obj)
+                else:
+                    c = clean_path_string(item)
+                    if c:
+                        ent = detect_entity_from_path(c)
+                        if ent:
+                            p_obj = Path(c)
+                            if p_obj not in entity_folders[ent]:
+                                entity_folders[ent].append(p_obj)
+                        else:
+                            logger.warning(
+                                "Could not map folder/link '{}' to any entity (India, UK, Singapore, Canada).", c
+                            )
+
+    return entity_folders
+
+
 def get_supported_files(folder_path: Path) -> List[Path]:
     """
     Recursively scans folder_path for supported tabular data files.
@@ -114,6 +221,9 @@ def get_supported_files(folder_path: Path) -> List[Path]:
     """
     supported_extensions = {".csv", ".tsv", ".txt", ".parquet", ".xlsx", ".xls"}
     files = []
+
+    if folder_path.is_file() and folder_path.suffix.lower() in supported_extensions:
+        return [folder_path]
 
     for root, _, filenames in os.walk(folder_path):
         for filename in sorted(filenames):
@@ -248,19 +358,47 @@ def iter_limited_csv_lines(
 
         nul_characters_removed[0] += chunk.count("\x00")
         chunk = chunk.replace("\x00", "")
+        pending_line.append(chunk)
         pending_length += len(chunk)
+
         if pending_length > field_size_limit:
-            raise ValueError(
-                f"{file_path.name}: physical line {line_number + 1} exceeds the "
-                f"{field_size_limit:,}-character safety limit; the CSV row is malformed or oversized."
+            raise csv.Error(
+                f"CSV field or physical line exceeded limit of {field_size_limit} characters "
+                f"in {file_path} at line {line_number + 1}."
             )
-        if chunk:
-            pending_line.append(chunk)
-        if chunk.endswith("\n"):
+
+        if chunk.endswith("\r") or chunk.endswith("\n"):
             line_number += 1
-            yield "".join(pending_line)
+            full_line = "".join(pending_line)
             pending_line = []
             pending_length = 0
+            yield full_line
+
+
+def build_copy_csv_buffer(
+    rows: List[List[str]],
+    file_path: Path,
+    expected_column_count: int,
+    line_offset: int,
+) -> io.StringIO:
+    """Builds an RFC-compliant CSV buffer for PostgreSQL COPY."""
+    s_buf = io.StringIO()
+    writer = csv.writer(
+        s_buf,
+        delimiter=",",
+        quotechar='"',
+        quoting=csv.QUOTE_MINIMAL,
+        lineterminator="\n",
+    )
+    for row_idx, row in enumerate(rows, start=line_offset):
+        if len(row) != expected_column_count:
+            raise ValueError(
+                f"Malformed row in {file_path} near line {row_idx}: "
+                f"expected {expected_column_count} fields, found {len(row)}."
+            )
+        writer.writerow(row)
+    s_buf.seek(0)
+    return s_buf
 
 
 def copy_csv_in_batches(
@@ -269,14 +407,21 @@ def copy_csv_in_batches(
     table_name: str,
     file_path: Path,
     clean_columns: List[str],
-    batch_size: int = 50000,
+    batch_size: int = 100000,
+    field_size_limit: Optional[int] = None,
 ) -> Tuple[int, int]:
     """
     Ultra-Fast Batch Ingestion:
-    Streams batches of raw CSV lines directly into PostgreSQL via COPY FROM STDIN.
+    Parses and sanitizes CSV rows into RFC-compliant COPY buffers.
     Achieves 50,000 - 100,000+ rows/second without DataFrame overhead.
     Returns (total_rows, total_batches).
     """
+    if field_size_limit is None:
+        field_size_limit = get_csv_field_size_limit()
+
+    previous_limit = csv.field_size_limit()
+    csv.field_size_limit(field_size_limit)
+
     col_clause = ", ".join([f'"{c}"' for c in clean_columns])
     copy_sql = (
         f'COPY "{schema_name}"."{table_name}" ({col_clause}) '
@@ -285,129 +430,87 @@ def copy_csv_in_batches(
 
     total_rows = 0
     batch_count = 0
-    nul_characters_removed = [0]
-    padded_rows = 0
-    padded_fields = 0
+    nul_tracker = [0]
 
-    field_size_limit = get_csv_field_size_limit()
     try:
-        csv.field_size_limit(field_size_limit)
-    except OverflowError as exc:
-        raise ValueError("CSV_FIELD_SIZE_LIMIT exceeds the supported range.") from exc
-
-    with open(file_path, "r", encoding="utf-8", errors="replace", newline="") as f:
-        reader = csv.reader(
-            iter_limited_csv_lines(f, file_path, field_size_limit, nul_characters_removed)
-        )
-        next(reader, None)
-
-        batch_buffer = io.StringIO(newline="")
-        writer = csv.writer(batch_buffer, lineterminator="\n")
-        rows_in_batch = 0
-
-        with raw_conn.cursor() as cur:
+        with open(file_path, "r", encoding="utf-8", errors="replace", newline="") as fp:
+            line_stream = iter_limited_csv_lines(
+                source=fp,
+                file_path=file_path,
+                field_size_limit=field_size_limit,
+                nul_characters_removed=nul_tracker,
+            )
+            reader = csv.reader(line_stream)
             try:
-                for record_number, row in enumerate(reader, start=2):
-                    if len(row) > len(clean_columns):
-                        logger.error(
-                            "Malformed CSV row: file={} record={} physical_line={} "
-                            "actual_fields={} expected_fields={} row={}",
-                            file_path.name,
-                            record_number,
-                            reader.line_num,
-                            len(row),
-                            len(clean_columns),
-                            json.dumps(row, ensure_ascii=False),
-                        )
-                        raise ValueError(
-                            f"{file_path.name}: CSV record {record_number} (ending at line "
-                            f"{reader.line_num}) has {len(row)} fields; expected at most "
-                            f"{len(clean_columns)}."
-                        )
-                    if len(row) < len(clean_columns):
-                        missing_fields = len(clean_columns) - len(row)
-                        logger.error(
-                            "CSV row has missing trailing fields: file={} record={} physical_line={} "
-                            "actual_fields={} expected_fields={} row={}",
-                            file_path.name,
-                            record_number,
-                            reader.line_num,
-                            len(row),
-                            len(clean_columns),
-                            json.dumps(row, ensure_ascii=False),
-                        )
-                        row.extend([""] * missing_fields)
-                        padded_rows += 1
-                        padded_fields += missing_fields
+                _ = next(reader)  # Skip header
+            except StopIteration:
+                return 0, 0
 
-                    cleaned_row = []
-                    for value in row:
-                        cleaned_row.append(value.replace("\x00", ""))
-                    writer.writerow(cleaned_row)
-                    rows_in_batch += 1
+            batch_rows: List[List[str]] = []
+            line_offset = 2
 
-                    if rows_in_batch >= batch_size:
+            with raw_conn.cursor() as cur:
+                for row in reader:
+                    batch_rows.append(row)
+                    if len(batch_rows) >= batch_size:
                         batch_start = time.time()
-                        batch_buffer.seek(0)
-                        cur.copy_expert(copy_sql, batch_buffer)
+                        s_buf = build_copy_csv_buffer(
+                            rows=batch_rows,
+                            file_path=file_path,
+                            expected_column_count=len(clean_columns),
+                            line_offset=line_offset,
+                        )
+                        cur.copy_expert(copy_sql, s_buf)
                         raw_conn.commit()
 
+                        rows_in_batch = len(batch_rows)
                         total_rows += rows_in_batch
                         batch_count += 1
                         batch_duration = time.time() - batch_start
                         speed = rows_in_batch / batch_duration if batch_duration > 0 else 0
                         logger.info(
-                            "      * Batch {}: {} rows committed via COPY in {:.2f}s ({:.0f} rows/s)",
+                            "      * Batch {}: {:,} rows committed via COPY in {:.2f}s ({:,.0f} rows/s)",
                             batch_count,
                             rows_in_batch,
                             batch_duration,
                             speed,
                         )
-                        batch_buffer.seek(0)
-                        batch_buffer.truncate(0)
-                        rows_in_batch = 0
-            except csv.Error as exc:
-                logger.exception(
-                    "CSV parsing failed in {} near physical line {}",
-                    file_path.name,
-                    reader.line_num,
-                )
-                raise ValueError(
-                    f"{file_path.name}: CSV parsing failed at physical line {reader.line_num}: {exc}"
-                ) from exc
+                        line_offset += rows_in_batch
+                        batch_rows = []
 
-            if rows_in_batch:
-                batch_start = time.time()
-                batch_buffer.seek(0)
-                cur.copy_expert(copy_sql, batch_buffer)
-                raw_conn.commit()
+                if batch_rows:
+                    batch_start = time.time()
+                    s_buf = build_copy_csv_buffer(
+                        rows=batch_rows,
+                        file_path=file_path,
+                        expected_column_count=len(clean_columns),
+                        line_offset=line_offset,
+                    )
+                    cur.copy_expert(copy_sql, s_buf)
+                    raw_conn.commit()
 
-                total_rows += rows_in_batch
-                batch_count += 1
-                batch_duration = time.time() - batch_start
-                speed = rows_in_batch / batch_duration if batch_duration > 0 else 0
-                logger.info(
-                    "      * Batch {}: {} rows committed via COPY in {:.2f}s ({:.0f} rows/s)",
-                    batch_count,
-                    rows_in_batch,
-                    batch_duration,
-                    speed,
-                )
+                    rows_in_batch = len(batch_rows)
+                    total_rows += rows_in_batch
+                    batch_count += 1
+                    batch_duration = time.time() - batch_start
+                    speed = rows_in_batch / batch_duration if batch_duration > 0 else 0
+                    logger.info(
+                        "      * Batch {}: {:,} rows committed via COPY in {:.2f}s ({:,.0f} rows/s)",
+                        batch_count,
+                        rows_in_batch,
+                        batch_duration,
+                        speed,
+                    )
 
-    if nul_characters_removed[0]:
-        logger.warning(
-            "Removed {} NUL character(s) from {} because PostgreSQL text columns cannot store them.",
-            nul_characters_removed[0],
-            file_path.name,
-        )
-    if padded_rows:
-        logger.warning(
-            "Padded {} row(s) in {} with {} trailing empty field(s) to match the {}-column header.",
-            padded_rows,
-            file_path.name,
-            padded_fields,
-            len(clean_columns),
-        )
+        if nul_tracker[0] > 0:
+            logger.warning(
+                "Sanitized {} NUL (0x00) byte(s) while streaming {}.",
+                nul_tracker[0],
+                file_path.name,
+            )
+
+    finally:
+        csv.field_size_limit(previous_limit)
 
     return total_rows, batch_count
 
@@ -417,9 +520,7 @@ def read_file_in_batches(
     batch_size: int,
     preserve_raw: bool = True,
 ) -> Generator[pd.DataFrame, None, None]:
-    """
-    Fallback DataFrame batch generator for non-CSV files (Parquet, Excel, TSV).
-    """
+    """Fallback DataFrame batch generator for non-CSV files (Parquet, Excel, TSV)."""
     ext = file_path.suffix.lower()
 
     if ext in {".csv", ".tsv", ".txt"}:
@@ -464,80 +565,217 @@ def read_file_in_batches(
             yield df.iloc[i : i + batch_size]
 
 
-def run_dry_run(folder_paths: List[Path], batch_size: int, schema_name: str) -> None:
+def run_dry_run(entity_folders: Dict[str, List[Path]], batch_size: int, schema_name: str) -> None:
     """
-    Executes a dry-run preview: scans directories, previews tables, columns,
-    and batches without connecting to PostgreSQL.
+    Executes a dry-run preview: displays the entity mapping, scans directories,
+    previews tables, columns, and batches without connecting to PostgreSQL.
     """
-    print("\n" + "=" * 95)
-    print(" DRY RUN PREVIEW (No database writes)")
-    print("=" * 95)
+    print("\n" + "=" * 105)
+    print(" DRY RUN PREVIEW: ENTITY MAPPING & INGESTION PLAN")
+    print("=" * 105)
     print(f"Target Schema: {schema_name}")
     print(f"Batch Size:    {batch_size:,} rows\n")
 
     total_files_overall = 0
     dry_run_start = time.time()
 
-    for folder_path in folder_paths:
-        table_name = sanitize_identifier(folder_path.name)
-        print(f"[*] Folder:     {folder_path}")
-        print(f"    Table Name: {schema_name}.{table_name}")
+    for idx, entity in enumerate(SUPPORTED_ENTITIES, start=1):
+        country_display = entity.title() if entity != "uk" else "UK"
+        table_name = f"internal_{entity}_data"
+        full_table = f"{schema_name}.{table_name}"
+        folders = entity_folders.get(entity, [])
 
-        if not folder_path.exists():
-            logger.warning("Dry-run folder does not exist: {}", folder_path)
-            print(f"    [WARNING] Directory does not exist: {folder_path}\n")
+        print(f"[{idx}/4] Entity: {country_display}")
+        print(f"      Target Table: {full_table}")
+
+        if not folders:
+            print("      Folder(s):    None configured (Skipped)\n")
             continue
 
-        files = get_supported_files(folder_path)
+        folder_str = ", ".join(str(f) for f in folders)
+        print(f"      Folder(s):    {folder_str}")
+
+        files: List[Path] = []
+        for folder_path in folders:
+            if not folder_path.exists():
+                print(f"      [WARNING] Path does not exist: {folder_path}")
+                continue
+            files.extend(get_supported_files(folder_path))
+
         total_files_overall += len(files)
-        print(f"    Files Found: {len(files)}")
+        print(f"      Files Found:  {len(files)}")
 
-        sample_cols = []
-        folder_dry_start = time.time()
+        if not files:
+            print("      Status:       No data files found.\n")
+            continue
 
-        for idx, f in enumerate(files, start=1):
-            file_sample_start = time.time()
+        sample_cols: List[str] = []
+        entity_start = time.time()
+
+        for f_idx, f in enumerate(files, start=1):
+            file_start = time.time()
             rows_sampled = 0
             try:
-                # Fast sample from first line
                 with open(f, "r", encoding="utf-8", errors="ignore") as fp:
                     header = fp.readline().strip()
                     sample_cols = [sanitize_identifier(c) for c in next(csv.reader([header]))]
-                    # Count preview lines up to batch_size
                     for _ in range(min(batch_size, 5000)):
                         if not fp.readline():
                             break
                         rows_sampled += 1
 
-                sample_duration = time.time() - file_sample_start
+                sample_duration = time.time() - file_start
                 print(
-                    f"    - [{idx}/{len(files)}] {f.name:<45} (Sampled {rows_sampled:,} rows in {format_duration(sample_duration)})"
+                    f"      - [{f_idx}/{len(files)}] {f.name:<45} (Sampled {rows_sampled:,} rows in {format_duration(sample_duration)})"
                 )
             except Exception as err:
-                logger.exception("Dry-run inspection failed for {}: {}", f, err)
-                print(f"    - [{idx}/{len(files)}] {f.name:<45} (Error: {err})")
+                print(f"      - [{f_idx}/{len(files)}] {f.name:<45} (Error: {err})")
 
-        folder_elapsed = time.time() - folder_dry_start
-        print(f"\n    Sample Columns ({len(sample_cols)}): {sample_cols[:8]}{'...' if len(sample_cols) > 8 else ''}")
-        print(f"    Folder scan completed in: {format_duration(folder_elapsed)}\n")
+        entity_elapsed = time.time() - entity_start
+        print(f"\n      Sample Columns ({len(sample_cols)}): {sample_cols[:8]}{'...' if len(sample_cols) > 8 else ''}")
+        print(f"      Entity scan completed in: {format_duration(entity_elapsed)}\n")
 
     total_elapsed = time.time() - dry_run_start
-    print(f"Total Folders: {len(folder_paths)}")
+    print("=" * 105)
     print(f"Total Files to Process: {total_files_overall}")
-    print(f"Total Dry-Run Time: {format_duration(total_elapsed)}")
-    print("=" * 95 + "\n")
+    print(f"Total Dry-Run Time:     {format_duration(total_elapsed)}")
+    print("=" * 105 + "\n")
+
+
+def prompt_terminal_entity_inputs(
+    env_entity_folders: Dict[str, List[Path]],
+) -> Dict[str, List[Path]]:
+    """
+    Prompts the user in the terminal to input data folder links for the entities.
+    Allows single entity input, all 4 entities input, or accepting .env defaults.
+    """
+    print("\n" + "=" * 80)
+    print(" JIOSTAR DATA INGESTION - TERMINAL INPUT")
+    print("=" * 80)
+    print("How would you like to provide the entity folder links?")
+    print("  [1] Enter link for a single entity (India / UK / Singapore / Canada)")
+    print("  [2] Enter links for all 4 entities (prompted one by one)")
+    print("  [3] Use saved links from .env directly")
+
+    try:
+        choice = input("\nEnter choice [1/2/3] (default: 2): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print("\nUsing defaults from .env.")
+        return env_entity_folders
+
+    result: Dict[str, List[Path]] = {e: [] for e in SUPPORTED_ENTITIES}
+
+    if choice == "1":
+        print("\nSelect Entity:")
+        print("  1. India      -> jiostar_data.internal_india_data")
+        print("  2. UK         -> jiostar_data.internal_uk_data")
+        print("  3. Singapore  -> jiostar_data.internal_singapore_data")
+        print("  4. Canada     -> jiostar_data.internal_canada_data")
+        try:
+            e_choice = input("Enter number [1-4] or entity name: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            return env_entity_folders
+
+        mapping = {"1": "india", "2": "uk", "3": "singapore", "4": "canada"}
+        selected = mapping.get(e_choice, e_choice)
+        if selected not in SUPPORTED_ENTITIES:
+            print(f"Invalid entity '{e_choice}'. Defaulting to all.")
+            selected = None
+        else:
+            defaults = env_entity_folders.get(selected, [])
+            default_val = ", ".join(str(p) for p in defaults) if defaults else "None"
+            prompt_str = f"Enter folder path or link for {selected.upper()}"
+            if default_val != "None":
+                prompt_str += f" [default: {default_val}]"
+            else:
+                prompt_str += " [default: Skip]"
+            try:
+                user_val = input(f"{prompt_str}: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                user_val = ""
+
+            final_val = user_val if user_val else (default_val if default_val != "None" else "")
+            if final_val and final_val != "Skip":
+                for sub_p in parse_folder_list(final_val):
+                    c = clean_path_string(sub_p)
+                    if c:
+                        result[selected].append(Path(c))
+            return result
+
+    if choice == "3":
+        return env_entity_folders
+
+    # Choice 2 (default): prompt all 4 entities
+    print("\nEnter folder path or link for each entity (press Enter to accept default or skip):")
+    for entity in SUPPORTED_ENTITIES:
+        country_display = entity.title() if entity != "uk" else "UK"
+        defaults = env_entity_folders.get(entity, [])
+        default_val = ", ".join(str(p) for p in defaults) if defaults else "Skip"
+        prompt_str = f"  * {country_display:<10} (Table: internal_{entity}_data) [default: {default_val}]"
+        try:
+            user_val = input(f"{prompt_str}: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            user_val = ""
+
+        final_val = user_val if user_val else (default_val if default_val != "Skip" else "")
+        if final_val and final_val != "Skip":
+            for sub_p in parse_folder_list(final_val):
+                c = clean_path_string(sub_p)
+                if c:
+                    result[entity].append(Path(c))
+
+    return result
 
 
 def import_folders_to_postgres():
-    """Main pipeline to orchestrate reading from folders and dumping to PostgreSQL."""
+    """Main pipeline to orchestrate mapping entities and batch dumping to PostgreSQL."""
     configure_logging()
 
     # 1. Parse Command Line Arguments
-    parser = argparse.ArgumentParser(description="Batch import data folders into PostgreSQL.")
+    parser = argparse.ArgumentParser(description="Batch import data folders into PostgreSQL mapped by entity.")
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Inspect folders, validate files, and preview batches without writing to DB.",
+        help="Inspect entity mappings, validate files, and preview batches without writing to DB.",
+    )
+    parser.add_argument(
+        "--entity",
+        choices=["india", "uk", "singapore", "canada", "all"],
+        help="Specify an entity to import directly from terminal.",
+    )
+    parser.add_argument(
+        "--link",
+        "--folder",
+        dest="link",
+        help="Specify the folder path or link for the entity directly.",
+    )
+    parser.add_argument(
+        "--india",
+        help="Directly specify the folder path or link for India.",
+    )
+    parser.add_argument(
+        "--uk",
+        help="Directly specify the folder path or link for UK.",
+    )
+    parser.add_argument(
+        "--singapore",
+        help="Directly specify the folder path or link for Singapore.",
+    )
+    parser.add_argument(
+        "--canada",
+        help="Directly specify the folder path or link for Canada.",
+    )
+    parser.add_argument(
+        "-i",
+        "--interactive",
+        action="store_true",
+        default=None,
+        help="Prompt interactively in the terminal for entity folder links.",
+    )
+    parser.add_argument(
+        "--non-interactive",
+        action="store_true",
+        help="Do not prompt in terminal; use values from .env or CLI flags.",
     )
     args = parser.parse_args()
 
@@ -558,26 +796,57 @@ def import_folders_to_postgres():
     schema_name = os.getenv("DB_SCHEMA", "jiostar_data")
 
     # Ingestion Parameters
-    raw_folders = os.getenv("DATA_FOLDERS", "")
-    # Optimal default batch size: 50,000 rows
-    batch_size = int(os.getenv("BATCH_SIZE", "50000"))
+    batch_size = int(os.getenv("BATCH_SIZE", "100000"))
     table_if_exists = os.getenv("TABLE_IF_EXISTS", "append").lower()
     preserve_raw = os.getenv("PRESERVE_RAW_STRINGS", "true").lower() in ("true", "1", "yes")
 
-    # Parse and validate folder paths
-    folder_strings = parse_folder_list(raw_folders)
-    if not folder_strings:
-        logger.error("No folders specified in DATA_FOLDERS within .env. Please configure DATA_FOLDERS.")
-        sys.exit(1)
+    # 4. Resolve Entity Data Folders / Links for the 4 Entities
+    env_entity_folders = resolve_entity_folders()
 
-    folder_paths = [Path(p.strip()) for p in folder_strings]
+    # Check CLI overrides
+    cli_specified = False
+    entity_folders: Dict[str, List[Path]] = {e: [] for e in SUPPORTED_ENTITIES}
+
+    for entity in SUPPORTED_ENTITIES:
+        val = getattr(args, entity, None)
+        if val:
+            cli_specified = True
+            for sub_p in parse_folder_list(val):
+                c = clean_path_string(sub_p)
+                if c:
+                    entity_folders[entity].append(Path(c))
+
+    if args.entity and args.link:
+        cli_specified = True
+        target_entities = SUPPORTED_ENTITIES if args.entity == "all" else [args.entity]
+        for ent in target_entities:
+            for sub_p in parse_folder_list(args.link):
+                c = clean_path_string(sub_p)
+                if c:
+                    entity_folders[ent].append(Path(c))
+
+    if cli_specified:
+        logger.info("Using entity links provided via command-line arguments.")
+    elif args.non_interactive or (not args.interactive and not sys.stdin.isatty()):
+        entity_folders = env_entity_folders
+    else:
+        # Prompt user in terminal
+        entity_folders = prompt_terminal_entity_inputs(env_entity_folders)
+
+    total_configured_folders = sum(len(f_list) for f_list in entity_folders.values())
+    if total_configured_folders == 0:
+        logger.error(
+            "No data folders/links mapped for any entity (India, UK, Singapore, Canada). "
+            "Please configure in terminal prompt, CLI flags, or DATA_FOLDER_* in .env."
+        )
+        sys.exit(1)
 
     # Handle dry run
     if args.dry_run:
-        run_dry_run(folder_paths, batch_size, schema_name)
+        run_dry_run(entity_folders, batch_size, schema_name)
         return
 
-    # 4. Initialize Database Engine
+    # 5. Initialize Database Engine
     db_url = f"postgresql+psycopg2://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}"
     logger.info("Connecting to PostgreSQL at {}:{} / {}...", db_host, db_port, db_name)
 
@@ -588,58 +857,60 @@ def import_folders_to_postgres():
             "Could not connect to PostgreSQL. Please check credentials in .env and verify the database is running."
         )
         logger.error(
-            "Tip: You can preview folder contents and batches without a database by running: python main.py --dry-run"
+            "Tip: You can preview entity mappings and batches without a database by running: python main.py --dry-run"
         )
         sys.exit(1)
 
-    # 5. Create Schema
+    # 6. Create Target Schema (jiostar_data)
     ensure_schema_exists(engine, schema_name)
 
-    # 6. Process Folders
+    # 7. Process Entities (India, UK, Singapore, Canada)
     start_time = time.time()
     summary_results = []
     file_upload_stats = []
 
-    # Obtain a dedicated raw connection for ultra-fast COPY streaming
     raw_conn = engine.raw_connection()
 
     try:
-        for folder_path in folder_paths:
-            folder_start_time = time.time()
-            raw_folder_name = folder_path.name
-            table_name = sanitize_identifier(raw_folder_name)
+        for entity in SUPPORTED_ENTITIES:
+            country_display = entity.title() if entity != "uk" else "UK"
+            table_name = f"internal_{entity}_data"
+            full_table = f"{schema_name}.{table_name}"
+            folders = entity_folders.get(entity, [])
 
-            logger.info("=" * 70)
-            logger.info("Processing Folder: '{}' -> Table: '{}.{}'", folder_path, schema_name, table_name)
-            logger.info("=" * 70)
-
-            if not folder_path.exists():
-                logger.warning("Folder does not exist: {}. Skipping.", folder_path)
-                summary_results.append({
-                    "folder": str(folder_path),
-                    "table": table_name,
-                    "status": "FOLDER_NOT_FOUND",
-                    "files": 0,
-                    "rows": 0,
-                    "duration": "0.00s",
-                })
+            if not folders:
+                logger.info("Entity '{}': No folder or link configured. Skipping.", country_display)
                 continue
 
-            files = get_supported_files(folder_path)
+            entity_start_time = time.time()
+            logger.info("=" * 80)
+            logger.info("Processing Entity: '{}' -> Table: '{}'", country_display, full_table)
+            logger.info("=" * 80)
+
+            # Discover all files for this entity
+            files: List[Path] = []
+            for folder_path in folders:
+                if not folder_path.exists():
+                    logger.warning("Folder does not exist for entity '{}': {}", country_display, folder_path)
+                    continue
+                folder_files = get_supported_files(folder_path)
+                logger.info("  Mapped folder '{}': found {} file(s).", folder_path, len(folder_files))
+                files.extend(folder_files)
+
             if not files:
-                logger.warning("No supported tabular data files found in {}.", folder_path)
+                logger.warning("No supported tabular data files found for entity '{}'. Skipping.", country_display)
                 summary_results.append({
-                    "folder": str(folder_path),
-                    "table": table_name,
+                    "entity": country_display,
+                    "table": full_table,
+                    "folders": ", ".join(str(f) for f in folders),
                     "status": "NO_FILES_FOUND",
                     "files": 0,
-                    "rows": 0,
+                    "rows": "0",
                     "duration": "0.00s",
                 })
                 continue
 
-            logger.info("Found {} data file(s) in '{}'.", len(files), folder_path)
-
+            # Check if table exists
             inspector = inspect(engine)
             table_exists = inspector.has_table(table_name, schema=schema_name)
 
@@ -647,15 +918,16 @@ def import_folders_to_postgres():
                 with engine.begin() as conn:
                     conn.execute(text(f'DROP TABLE IF EXISTS "{schema_name}"."{table_name}" CASCADE;'))
                 table_exists = False
-                logger.info("Dropped existing table '{}.{}' (TABLE_IF_EXISTS=replace).", schema_name, table_name)
+                logger.info("Dropped existing table '{}' (TABLE_IF_EXISTS=replace).", full_table)
 
             known_columns: Set[str] = set()
             if table_exists:
                 known_columns = get_table_columns(engine, schema_name, table_name)
 
-            total_folder_rows = 0
-            total_folder_batches = 0
+            total_entity_rows = 0
+            total_entity_batches = 0
 
+            # Ingest all files into schema_name.internal_<country_name>_data
             for file_idx, file_path in enumerate(files, start=1):
                 file_start_time = time.time()
                 logger.info("[{}/{}] Starting upload: {}", file_idx, len(files), file_path.name)
@@ -666,7 +938,7 @@ def import_folders_to_postgres():
 
                 try:
                     if is_csv:
-                        # Extract column header from CSV
+                        # Extract column header
                         with open(file_path, "r", encoding="utf-8", errors="replace", newline="") as fp:
                             raw_cols = next(csv.reader(fp), [])
                             clean_cols = [sanitize_identifier(c) for c in raw_cols]
@@ -676,6 +948,7 @@ def import_folders_to_postgres():
                             create_table_if_not_exists(engine, schema_name, table_name, clean_cols)
                             table_exists = True
                             known_columns = set(clean_cols)
+                            logger.info("Created table '{}' with {} columns.", full_table, len(clean_cols))
                         else:
                             sync_table_columns(engine, schema_name, table_name, clean_cols, known_columns)
 
@@ -716,6 +989,7 @@ def import_folders_to_postgres():
                                 )
                                 table_exists = True
                                 known_columns = get_table_columns(engine, schema_name, table_name)
+                                logger.info("Created table '{}' with {} columns.", full_table, len(clean_cols))
                             else:
                                 sync_table_columns(engine, schema_name, table_name, clean_cols, known_columns)
                                 batch_df.to_sql(
@@ -732,23 +1006,24 @@ def import_folders_to_postgres():
                             file_rows += b_rows
                             file_batches += 1
 
-                    total_folder_rows += file_rows
-                    total_folder_batches += file_batches
+                    total_entity_rows += file_rows
+                    total_entity_batches += file_batches
 
                     file_duration = time.time() - file_start_time
                     throughput = (file_rows / file_duration) if file_duration > 0 else 0
                     logger.info(
-                        "    -> Completed '{}' in {} ({}, {} batches, {:.0f} rows/s).",
+                        "    -> Completed '{}' in {} ({:,} rows, {} batches, {:.0f} rows/s).",
                         file_path.name,
                         format_duration(file_duration),
-                        f"{file_rows:,}",
+                        file_rows,
                         file_batches,
                         throughput,
                     )
 
                     file_upload_stats.append({
                         "file_name": file_path.name,
-                        "table": f"{schema_name}.{table_name}",
+                        "entity": country_display,
+                        "table": full_table,
                         "rows": f"{file_rows:,}",
                         "batches": file_batches,
                         "duration_sec": file_duration,
@@ -768,7 +1043,8 @@ def import_folders_to_postgres():
                     )
                     file_upload_stats.append({
                         "file_name": file_path.name,
-                        "table": f"{schema_name}.{table_name}",
+                        "entity": country_display,
+                        "table": full_table,
                         "rows": f"{file_rows:,}",
                         "batches": file_batches,
                         "duration_sec": file_duration,
@@ -777,63 +1053,51 @@ def import_folders_to_postgres():
                         "status": "FAILED",
                     })
 
-            elapsed = time.time() - folder_start_time
+            elapsed = time.time() - entity_start_time
             summary_results.append({
-                "folder": str(folder_path),
-                "table": f"{schema_name}.{table_name}",
+                "entity": country_display,
+                "table": full_table,
+                "folders": ", ".join(str(f) for f in folders),
                 "status": "SUCCESS",
                 "files": len(files),
-                "rows": f"{total_folder_rows:,}",
+                "rows": f"{total_entity_rows:,}",
                 "duration": format_duration(elapsed),
             })
 
     finally:
         raw_conn.close()
 
-    # 7. Print Final Execution Summary Tables
+    # 8. Print Final Execution Summary Tables
     total_elapsed = time.time() - start_time
-
-    logger.info("FOLDER-LEVEL INGESTION SUMMARY")
-    for res in summary_results:
-        logger.info(
-            "Folder={} Table={} Files={} Rows={} Duration={} Status={}",
-            res["folder"],
-            res["table"],
-            res["files"],
-            res["rows"],
-            res["duration"],
-            res["status"],
-        )
-    logger.info("Total Pipeline Duration: {}", format_duration(total_elapsed))
 
     # Per-File Upload Performance Report
     if file_upload_stats:
-        print("\n" + "=" * 110)
+        print("\n" + "=" * 115)
         print(" PER-FILE UPLOAD PERFORMANCE (TIME TAKEN PER FILE)")
-        print("=" * 110)
+        print("=" * 115)
         print(
-            f"{'File Name':<35} {'Target Table':<32} {'Rows':<12} {'Batches':<9} {'Time Taken':<12} {'Speed':<14}"
+            f"{'File Name':<35} {'Entity':<12} {'Target Table':<32} {'Rows':<12} {'Batches':<9} {'Time Taken':<12} {'Speed':<14}"
         )
-        print("-" * 110)
+        print("-" * 115)
         for stat in file_upload_stats:
             print(
-                f"{stat['file_name'][:33]:<35} {stat['table'][:30]:<32} {stat['rows']:<12} "
-                f"{stat['batches']:<9} {stat['duration_str']:<12} {stat['speed']:<14}"
+                f"{stat['file_name'][:33]:<35} {stat['entity'][:10]:<12} {stat['table'][:30]:<32} "
+                f"{stat['rows']:<12} {stat['batches']:<9} {stat['duration_str']:<12} {stat['speed']:<14}"
             )
-        print("=" * 110)
+        print("=" * 115)
 
-    # Folder-Level Aggregate Report
-    print("\n" + "=" * 100)
-    print(" FOLDER-LEVEL INGESTION SUMMARY")
-    print("=" * 100)
-    print(f"{'Folder':<40} {'Table Name':<30} {'Files':<8} {'Rows':<12} {'Duration':<12}")
-    print("-" * 100)
+    # Entity-Level Aggregate Report
+    print("\n" + "=" * 110)
+    print(" ENTITY-LEVEL INGESTION SUMMARY")
+    print("=" * 110)
+    print(f"{'Entity':<12} {'Target Table':<34} {'Files':<8} {'Rows':<14} {'Duration':<12} {'Status':<10}")
+    print("-" * 110)
     for res in summary_results:
         print(
-            f"{res['folder'][:38]:<40} {res['table'][:28]:<30} {res['files']:<8} "
-            f"{res['rows']:<12} {res['duration']:<12}"
+            f"{res['entity']:<12} {res['table'][:32]:<34} {res['files']:<8} "
+            f"{res['rows']:<14} {res['duration']:<12} {res['status']:<10}"
         )
-    print("=" * 100)
+    print("=" * 110)
     print(f"Total Pipeline Duration: {format_duration(total_elapsed)}\n")
 
 
