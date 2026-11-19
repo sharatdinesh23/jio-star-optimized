@@ -431,6 +431,7 @@ def copy_csv_in_batches(
     total_rows = 0
     batch_count = 0
     nul_tracker = [0]
+    source_name = file_path.name
 
     try:
         with open(file_path, "r", encoding="utf-8", errors="replace", newline="") as fp:
@@ -451,6 +452,8 @@ def copy_csv_in_batches(
 
             with raw_conn.cursor() as cur:
                 for row in reader:
+                    # Append source_name (file name) to each row
+                    row.append(source_name)
                     batch_rows.append(row)
                     if len(batch_rows) >= batch_size:
                         batch_start = time.time()
@@ -619,6 +622,8 @@ def run_dry_run(entity_folders: Dict[str, List[Path]], batch_size: int, schema_n
                 with open(f, "r", encoding="utf-8", errors="ignore") as fp:
                     header = fp.readline().strip()
                     sample_cols = [sanitize_identifier(c) for c in next(csv.reader([header]))]
+                    if "source_name" not in sample_cols:
+                        sample_cols.append("source_name")
                     for _ in range(min(batch_size, 5000)):
                         if not fp.readline():
                             break
@@ -943,12 +948,16 @@ def import_folders_to_postgres():
                             raw_cols = next(csv.reader(fp), [])
                             clean_cols = [sanitize_identifier(c) for c in raw_cols]
 
+                        # Add source_name column to track the source file name
+                        if "source_name" not in clean_cols:
+                            clean_cols.append("source_name")
+
                         # Create table if it doesn't exist yet
                         if not table_exists:
                             create_table_if_not_exists(engine, schema_name, table_name, clean_cols)
                             table_exists = True
                             known_columns = set(clean_cols)
-                            logger.info("Created table '{}' with {} columns.", full_table, len(clean_cols))
+                            logger.info("Created table '{}' with {} columns (including source_name).", full_table, len(clean_cols))
                         else:
                             sync_table_columns(engine, schema_name, table_name, clean_cols, known_columns)
 
@@ -975,6 +984,8 @@ def import_folders_to_postgres():
                                 continue
 
                             batch_df.columns = [sanitize_identifier(c) for c in batch_df.columns]
+                            # Add source_name column with the source file name
+                            batch_df["source_name"] = file_path.name
                             clean_cols = list(batch_df.columns)
 
                             if not table_exists:
@@ -989,7 +1000,7 @@ def import_folders_to_postgres():
                                 )
                                 table_exists = True
                                 known_columns = get_table_columns(engine, schema_name, table_name)
-                                logger.info("Created table '{}' with {} columns.", full_table, len(clean_cols))
+                                logger.info("Created table '{}' with {} columns (including source_name).", full_table, len(clean_cols))
                             else:
                                 sync_table_columns(engine, schema_name, table_name, clean_cols, known_columns)
                                 batch_df.to_sql(

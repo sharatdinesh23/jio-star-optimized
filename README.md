@@ -24,6 +24,7 @@ $$\text{schema\_name}.\text{internal\_<country\_name>\_data}$$
 
 ## Features
 
+- **Automatic `source_name` Metadata Tracking**: Appends a `source_name` column to every target table storing the exact file name (e.g. `bot_in_daily_2026-10-01.csv`) from which each row originated.
 - **Entity-Based Auto-Mapping**: Configure paths via dedicated country variables (`DATA_FOLDER_INDIA`, `DATA_FOLDER_UK`, etc.) or via `DATA_FOLDERS` with automatic entity detection.
 - **Ultra-Fast PostgreSQL COPY Streaming**: Direct `COPY FROM STDIN` streaming enables loading 4–5 lakh records in ~5–10 seconds.
 - **Multi-File Batching**: Multiple daily or monthly files inside an entity folder are automatically merged into the entity's target table.
